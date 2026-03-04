@@ -3,6 +3,14 @@
 
 let lastSentTime = -1;
 
+// Sends a message safely, swallowing both synchronous throws (invalidated
+// extension context after a reload) and promise rejections (no listener).
+function safeSend(msg) {
+  try {
+    chrome.runtime.sendMessage(msg).catch(() => {});
+  } catch (_) {}
+}
+
 // Poll the <video> element and forward time updates to the side panel
 setInterval(() => {
   const video = document.querySelector("video");
@@ -11,11 +19,7 @@ setInterval(() => {
   // Only send when time changed meaningfully (reduces noise while paused)
   if (Math.abs(t - lastSentTime) > 0.3 || !video.paused) {
     lastSentTime = t;
-    chrome.runtime.sendMessage({
-      type:   "timeUpdate",
-      time:   t,
-      paused: video.paused
-    }).catch(() => {}); // side panel may not be open yet – ignore
+    safeSend({ type: "timeUpdate", time: t, paused: video.paused });
   }
 }, 500);
 
@@ -24,10 +28,7 @@ let lastUrl = location.href;
 new MutationObserver(() => {
   if (location.href !== lastUrl) {
     lastUrl = location.href;
-    chrome.runtime.sendMessage({
-      type: "urlChange",
-      url:  location.href
-    }).catch(() => {});
+    safeSend({ type: "urlChange", url: location.href });
   }
 }).observe(document, { subtree: true, childList: true });
 
