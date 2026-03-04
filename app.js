@@ -96,7 +96,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     videoPaused = msg.paused || false;
     if (chunks.length > 0) {
       timeDisplay.textContent = formatTime(currentPlayerTime);
-      if (!videoPaused) pollTick();
+      pollTick(); // always tick on time update, paused or not
     }
   }
   if (msg.type === "urlChange") {
@@ -105,6 +105,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     document.getElementById("not-youtube-msg").classList.toggle("hidden", isYT);
     document.getElementById("url-detected-badge").classList.toggle("hidden", !isYT);
     if (chunks.length > 0) {
+      stopFallbackPolling();
       chunks = []; chunkResults = {}; currentChunkIdx = -1; currentPlayerTime = 0;
       workspace.classList.add("hidden");
       showSetupError("New video detected! Click \u2018Start Fact Check\u2019 to analyze it.");
@@ -158,6 +159,12 @@ async function handleLoad() {
     chunkStatus.textContent = "";
     timeDisplay.textContent = "0:00";
 
+    // Start fallback polling in case content script messages are delayed
+    startFallbackPolling();
+
+    // Immediately run a poll tick so chunk 0 group is created and fetching starts
+    pollTick();
+
     // Scroll workspace into view
     workspace.scrollIntoView({ behavior: "smooth" });
 
@@ -169,7 +176,21 @@ async function handleLoad() {
   }
 }
 
-/* ── Polling (driven by content.js timeUpdate messages) ──────────── */
+/* ── Polling (driven by content.js timeUpdate messages + fallback interval) ── */
+let fallbackTimer = null;
+
+function startFallbackPolling() {
+  if (fallbackTimer) return;
+  fallbackTimer = setInterval(() => {
+    if (chunks.length > 0) pollTick();
+  }, 1000);
+}
+
+function stopFallbackPolling() {
+  clearInterval(fallbackTimer);
+  fallbackTimer = null;
+}
+
 function pollTick() {
   if (!chunks.length) return;
   const t = currentPlayerTime;
@@ -181,7 +202,8 @@ function pollTick() {
   const idx = chunkIndexAt(t);
   if (idx === -1) return;
 
-  // Pre-fetch ahead
+  // Fetch current + pre-fetch ahead
+  fetchChunk(idx);
   if (idx + 1 < chunks.length) fetchChunk(idx + 1);
   if (idx + 2 < chunks.length) fetchChunk(idx + 2);
 
@@ -385,6 +407,8 @@ function chunkIndexAt(t) {
     if (t >= chunks[i].start && t < chunks[i].end) return i;
   }
   if (chunks.length && t >= chunks[chunks.length - 1].start) return chunks.length - 1;
+  // Before first chunk starts — still return 0 so pre-fetching begins immediately
+  if (chunks.length && t < chunks[0].start) return 0;
   return -1;
 }
 
