@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: factcheck-ext-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 2 -b 0.0.0.0:$PORT server:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
