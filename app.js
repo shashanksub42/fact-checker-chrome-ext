@@ -2,20 +2,38 @@
    FactCheckAI  –  app.js
    ══════════════════════════════════════════════════════════════════ */
 
-const API_BASE   = "https://factcheck-api.onrender.com";
+const API_BASE   = "https://fact-checker-chrome-ext.onrender.com";
 const ARCHIVE_KEY = "factcheck_archive";   // localStorage key
 
+/* ── Server wake-up ping ─────────────────────────────────────────── */
+// Render free tier sleeps after inactivity; ping /health on load so the
+// server is warm by the time the user clicks the button.
+(function pingServer() {
+  const badge = document.getElementById("server-status");
+  if (badge) { badge.textContent = "⏳ Server waking up…"; badge.className = "server-badge waking"; }
+  const t0 = Date.now();
+  const ctrl = new AbortController();
+  const tid = setTimeout(() => ctrl.abort(), 90000);
+  fetch(API_BASE + "/health", { signal: ctrl.signal })
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(() => {
+      if (badge) { badge.textContent = "✓ Server ready"; badge.className = "server-badge ready"; }
+      setTimeout(() => { if (badge) badge.classList.add("fade-out"); }, 3000);
+    })
+    .catch(() => {
+      if (badge) { badge.textContent = "✗ Server unreachable"; badge.className = "server-badge error"; }
+    })
+    .finally(() => clearTimeout(tid));
+})();
+
 /* ── State ───────────────────────────────────────────────────────── */
-let ytApiReady     = false;
-let playerReady    = false;
-let pendingVideoId = null;     // video ID waiting for sandboxed player to be ready
-let currentPlayerTime = 0;    // updated via postMessage from player.html
-let videoTitle     = "";
-let chunks         = [];       // [{start, end, text}]
+let currentPlayerTime = 0;    // relayed by content.js
+let videoPaused       = true;
+let videoTitle        = "";
+let chunks            = [];   // [{start, end, text}]
 
 let chunkResults   = {};       // chunkIdx -> {status:'pending'|'done'|'error', claims:[]}
 let currentChunkIdx = -1;
-let pollTimer      = null;
 let inFlight       = new Set();// chunk indices currently being fetched
 
 /* ── DOM refs ────────────────────────────────────────────────────── */
@@ -50,52 +68,47 @@ toggleKeyBtn.addEventListener("click", () => {
   apiKeyInput.type = apiKeyInput.type === "password" ? "text" : "password";
 });
 
-/* ── Sandboxed player bridge (postMessage) ───────────────────────── */
-// player.html is a sandboxed extension page that can load the YouTube
-// IFrame API (external scripts are blocked in regular MV3 extension pages).
-const YT_PLAYING = 1;
+/* ── Chrome extension: auto-detect tab URL + content script bridge ─── */
+function autoDetectUrl() {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const tab = tabs && tabs[0];
+    if (!tab) return;
+    const url = tab.url || "";
+    const isYT = /youtube\.com\/watch/.test(url);
+    ytUrlInput.value = url;
+    document.getElementById("not-youtube-msg").classList.toggle("hidden", isYT);
+    document.getElementById("url-detected-badge").classList.toggle("hidden", !isYT);
+  });
+}
+autoDetectUrl();
 
-function sendToPlayer(msg) {
-  const frame = document.getElementById("player-frame");
-  if (frame && frame.contentWindow) frame.contentWindow.postMessage(msg, "*");
+function seekInVideo(time) {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    if (tabs && tabs[0]) {
+      chrome.tabs.sendMessage(tabs[0].id, { type: "seekTo", time });
+    }
+  });
 }
 
-function createPlayer(videoId) {
-  playerReady = false;
-  if (ytApiReady) {
-    sendToPlayer({ type: "createPlayer", videoId });
-  } else {
-    pendingVideoId = videoId; // queued until player.html signals ytApiReady
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type === "timeUpdate") {
+    currentPlayerTime = msg.time || 0;
+    videoPaused = msg.paused || false;
+    if (chunks.length > 0) {
+      timeDisplay.textContent = formatTime(currentPlayerTime);
+      if (!videoPaused) pollTick();
+    }
   }
-}
-
-window.addEventListener("message", (e) => {
-  const msg = e.data;
-  if (!msg || !msg.type) return;
-
-  switch (msg.type) {
-    case "ytApiReady":
-      ytApiReady = true;
-      if (pendingVideoId) {
-        sendToPlayer({ type: "createPlayer", videoId: pendingVideoId });
-        pendingVideoId = null;
-      }
-      break;
-
-    case "playerReady":
-      playerReady = true;
-      break;
-
-    case "timeUpdate":
-      currentPlayerTime = msg.time || 0;
-      if (msg.state === YT_PLAYING && !pollTimer) startPolling();
-      if (msg.state !== YT_PLAYING &&  pollTimer) stopPolling();
-      break;
-
-    case "stateChange":
-      if (msg.state === YT_PLAYING) startPolling();
-      else stopPolling();
-      break;
+  if (msg.type === "urlChange") {
+    const isYT = /youtube\.com\/watch/.test(msg.url);
+    ytUrlInput.value = msg.url;
+    document.getElementById("not-youtube-msg").classList.toggle("hidden", isYT);
+    document.getElementById("url-detected-badge").classList.toggle("hidden", !isYT);
+    if (chunks.length > 0) {
+      chunks = []; chunkResults = {}; currentChunkIdx = -1; currentPlayerTime = 0;
+      workspace.classList.add("hidden");
+      showSetupError("New video detected! Click \u2018Start Fact Check\u2019 to analyze it.");
+    }
   }
 });
 
@@ -112,18 +125,23 @@ async function handleLoad() {
   if (!apiKey) { showSetupError("Please enter your OpenAI API key."); return; }
 
   hideSetupError();
-  setLoadBtnLoading(true);
+  setLoadBtnLoading(true, "Contacting server…");
+
+  // Render free tier can take 30–60 s to wake from sleep
+  const wakeTimer = setTimeout(() => {
+    setLoadBtnLoading(true, "Server is waking up (free tier)…");
+  }, 8000);
 
   try {
     const data = await fetchJSON("/api/load", { url });
-
+    clearTimeout(wakeTimer);
     videoTitle = data.title;
     chunks     = data.chunks;
     chunkResults = {};
     inFlight.clear();
-    stopPolling();
     currentChunkIdx = -1;
     currentPlayerTime = 0;
+    videoPaused = false;
 
     localStorage.setItem("factcheck_api_key", apiKey);
 
@@ -140,32 +158,20 @@ async function handleLoad() {
     chunkStatus.textContent = "";
     timeDisplay.textContent = "0:00";
 
-    // Create/reload player — createPlayer handles ytApiReady check internally
-    createPlayer(data.video_id);
-
     // Scroll workspace into view
     workspace.scrollIntoView({ behavior: "smooth" });
 
   } catch (err) {
+    clearTimeout(wakeTimer);
     showSetupError(err.message || "Failed to load video. Check the URL and try again.");
   } finally {
-    setLoadBtnLoading(false);
+    setLoadBtnLoading(false, "");
   }
 }
 
-/* ── Polling ─────────────────────────────────────────────────────── */
-function startPolling() {
-  if (pollTimer) return;
-  pollTimer = setInterval(pollTick, 800);
-}
-
-function stopPolling() {
-  clearInterval(pollTimer);
-  pollTimer = null;
-}
-
+/* ── Polling (driven by content.js timeUpdate messages) ──────────── */
 function pollTick() {
-  if (!playerReady) return;
+  if (!chunks.length) return;
   const t = currentPlayerTime;
 
   // Update clock
@@ -275,9 +281,7 @@ function ensureChunkGroup(idx) {
   header.textContent = formatTime(chunks[idx].start);
   header.title = "Jump to this segment";
   header.addEventListener("click", () => {
-    if (playerReady) {
-      sendToPlayer({ type: "seekTo", time: chunks[idx].start });
-    }
+    seekInVideo(chunks[idx].start);
   });
 
   const body = document.createElement("div");
@@ -469,10 +473,8 @@ function renderArchive() {
           <div class="arch-label">${escapeHtml(truncate(item.label, 80))}</div>
         </div>`;
       row.querySelector(".arch-ts-btn").addEventListener("click", () => {
-        if (playerReady) {
-          sendToPlayer({ type: "seekTo", time: item.timestamp });
-          workspace.scrollIntoView({ behavior: "smooth" });
-        }
+        seekInVideo(item.timestamp);
+        workspace.scrollIntoView({ behavior: "smooth" });
       });
       listEl.appendChild(row);
     });
@@ -526,18 +528,33 @@ function makePlaceholder(msg) {
 }
 
 async function fetchJSON(path, body) {
-  const res = await fetch(API_BASE + path, {
-    method:  "POST",
-    headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify(body)
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    const err = new Error(data.error || `HTTP ${res.status}`);
-    err.status = res.status;
-    throw err;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 90000); // 90 s
+  try {
+    const res = await fetch(API_BASE + path, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(body),
+      signal:  controller.signal
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      const err = new Error(data.error || `HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  } catch (e) {
+    if (e.name === "AbortError") {
+      throw new Error("Request timed out. The server may be starting up — please try again.");
+    }
+    if (e instanceof TypeError) {
+      throw new Error(`Network error: could not reach ${API_BASE}. Check your internet connection.`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeout);
   }
-  return data;
 }
 
 function showSetupError(msg) {
@@ -546,9 +563,9 @@ function showSetupError(msg) {
 }
 function hideSetupError() { setupError.classList.add("hidden"); }
 
-function setLoadBtnLoading(on) {
+function setLoadBtnLoading(on, msg) {
   loadBtn.disabled = on;
-  loadBtnText.textContent = on ? "Loading…" : "Load Video & Start Fact Check";
+  loadBtnText.textContent = on ? (msg || "Loading…") : "Load Video & Start Fact Check";
   loadSpinner.classList.toggle("hidden", !on);
 }
 

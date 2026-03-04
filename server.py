@@ -13,6 +13,10 @@ import os
 app = Flask(__name__)
 CORS(app, origins="*")
 
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"}), 200
+
 # Serve frontend static files
 @app.route("/")
 def index():

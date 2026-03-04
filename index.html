@@ -15,15 +15,23 @@
         <span class="logo-icon">⚖️</span>
         <span class="logo-text">FactCheck<span class="accent">AI</span></span>
       </div>
-      <p class="tagline">Real-time fact checking for YouTube videos</p>
+      <span id="server-status" class="server-badge waking">⏳ Connecting…</span>
     </div>
   </header>
 
   <!-- ── Setup Panel ──────────────────────────────────────────────── -->
   <section id="setup-panel" class="setup-panel">
     <div class="setup-inner">
+
+      <div id="not-youtube-msg" class="not-youtube-msg hidden">
+        ⚠ Open a YouTube video in this tab, then click the extension icon.
+      </div>
+
       <div class="input-group">
-        <label for="yt-url">YouTube URL</label>
+        <label for="yt-url">
+          YouTube URL
+          <span id="url-detected-badge" class="detected-badge hidden">● Auto-detected</span>
+        </label>
         <input
           type="text"
           id="yt-url"
@@ -59,57 +67,37 @@
   <!-- ── Main Workspace ───────────────────────────────────────────── -->
   <main id="workspace" class="workspace hidden">
 
-    <!-- Left column: player -->
-    <section class="left-col">
-
-      <div class="player-wrap">
-        <iframe
-          id="player-frame"
-          src="player.html"
-          frameborder="0"
-          allow="autoplay; encrypted-media"
-          allowfullscreen
-          style="width:100%;height:100%;border:0;"
-        ></iframe>
+    <!-- Video meta: title + time -->
+    <div class="video-meta">
+      <h2 id="video-title-display" class="video-title"></h2>
+      <div class="progress-info">
+        <span id="chunk-status"></span>
+        <span id="time-display" class="time-badge">0:00</span>
       </div>
+    </div>
 
-      <div class="video-meta">
-        <h2 id="video-title-display" class="video-title"></h2>
-        <div class="progress-info">
-          <span id="chunk-status"></span>
-          <span id="time-display" class="time-badge">0:00</span>
-        </div>
+    <!-- Fact-check results -->
+    <div class="results-panel">
+      <h3 class="panel-title">
+        🔍 Fact Check
+        <span id="fc-loading" class="fc-loading hidden">
+          <span class="dot-pulse"></span> Analysing…
+        </span>
+      </h3>
+      <div id="results-body" class="results-body">
+        <div class="placeholder-msg">Play the video to start fact checking…</div>
       </div>
+    </div>
 
-    </section>
-
-    <!-- Right column: results + archive -->
-    <section class="right-col">
-
-      <!-- Current fact-check results -->
-      <div class="results-panel">
-        <h3 class="panel-title">
-          🔍 Fact Check
-          <span id="fc-loading" class="fc-loading hidden">
-            <span class="dot-pulse"></span> Analysing…
-          </span>
-        </h3>
-        <div id="results-body" class="results-body">
-          <div class="placeholder-msg">Play the video to start fact checking…</div>
-        </div>
+    <!-- Archive -->
+    <div class="archive-panel">
+      <div class="archive-header">
+        <h3 class="panel-title">🗂 Source Archive</h3>
+        <button id="clear-archive-btn" class="ghost-btn" title="Clear archive">Clear</button>
       </div>
-
-      <!-- Archive -->
-      <div class="archive-panel">
-        <div class="archive-header">
-          <h3 class="panel-title">🗂 Source Archive</h3>
-          <button id="clear-archive-btn" class="ghost-btn" title="Clear archive">Clear</button>
-        </div>
-        <div id="archive-groups" class="archive-groups"></div>
-        <div id="archive-empty" class="placeholder-msg">No sources saved yet.</div>
-      </div>
-
-    </section>
+      <div id="archive-groups" class="archive-groups"></div>
+      <div id="archive-empty" class="placeholder-msg">No sources saved yet.</div>
+    </div>
 
   </main>
 

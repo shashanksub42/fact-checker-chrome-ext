@@ -5,22 +5,32 @@
   "description": "Real-time AI fact checking for YouTube videos",
 
   "action": {
-    "default_popup": "index.html",
     "default_title": "FactCheckAI"
   },
 
-  "sandbox": {
-    "pages": ["player.html"]
+  "side_panel": {
+    "default_path": "index.html"
   },
 
-  "permissions": ["storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["content.js"]
+    }
+  ],
+
+  "permissions": ["storage", "sidePanel", "activeTab", "tabs"],
 
   "host_permissions": [
-    "https://factcheck-api.onrender.com/*"
+    "https://fact-checker-chrome-ext.onrender.com/*",
+    "*://*.youtube.com/*"
   ],
 
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'",
-    "sandbox": "sandbox allow-scripts allow-forms allow-popups allow-modals; script-src 'self' https://www.youtube.com https://s.ytimg.com; child-src 'self'"
+    "extension_pages": "script-src 'self'; object-src 'self'"
   }
 }
