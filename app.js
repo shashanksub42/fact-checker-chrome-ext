@@ -338,7 +338,12 @@ async function factCheckWithOpenAI(text, apiKey, videoTitleStr) {
   }
 
   const json   = await res.json();
-  const result = JSON.parse(json.choices[0].message.content);
+  let result;
+  try {
+    result = JSON.parse(json.choices[0].message.content);
+  } catch {
+    throw new Error("OpenAI returned an unexpected response format. Please try again.");
+  }
   return { claims: result.claims || [] };
 }
 
@@ -694,13 +699,27 @@ async function fetchJSON(path, body) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 90000); // 90 s
   try {
-    const res = await fetch(API_BASE + path, {
+    const res  = await fetch(API_BASE + path, {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
       body:    JSON.stringify(body),
       signal:  controller.signal
     });
-    const data = await res.json();
+    // Read as text first — if the server is cold-starting or erroring it may
+    // return an HTML page, and calling .json() directly would throw a cryptic
+    // "Unexpected token '<'" parse error instead of a useful message.
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      // Server returned non-JSON (e.g. Render HTML error page)
+      throw new Error(
+        res.ok
+          ? "Server returned an unexpected response. Please try again."
+          : `Server error ${res.status} — the server may be starting up. Please try again in a moment.`
+      );
+    }
     if (!res.ok) {
       const err = new Error(data.error || `HTTP ${res.status}`);
       err.status = res.status;
