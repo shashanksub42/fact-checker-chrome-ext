@@ -27,6 +27,7 @@
 
   "host_permissions": [
     "https://fact-checker-chrome-ext.onrender.com/*",
+    "https://api.openai.com/*",
     "*://*.youtube.com/*"
   ],
 

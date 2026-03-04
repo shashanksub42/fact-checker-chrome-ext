@@ -69,14 +69,13 @@ async function setCachedChunkResult(videoId, idx, data) {
   await chrome.storage.local.set({ [`factcheck_chunk_${videoId}_${idx}`]: data });
 }
 
-/* ── Persist API key across sessions ─────────────────────────────── */
-(function restoreKey() {
-  const saved = localStorage.getItem("factcheck_api_key");
-  if (saved) apiKeyInput.value = saved;
-})();
+/* ── Persist API key across sessions (chrome.storage.local — sandboxed to ext) ─ */
+chrome.storage.local.get("factcheck_api_key", (result) => {
+  if (result.factcheck_api_key) apiKeyInput.value = result.factcheck_api_key;
+});
 
 apiKeyInput.addEventListener("change", () => {
-  localStorage.setItem("factcheck_api_key", apiKeyInput.value.trim());
+  chrome.storage.local.set({ factcheck_api_key: apiKeyInput.value.trim() });
 });
 
 toggleKeyBtn.addEventListener("click", () => {
@@ -209,7 +208,7 @@ function applyLoadedData(data, apiKey) {
   currentPlayerTime = 0;
   videoPaused       = false;
 
-  localStorage.setItem("factcheck_api_key", apiKey);
+  chrome.storage.local.set({ factcheck_api_key: apiKey });
 
   // Show workspace
   workspace.classList.remove("hidden");
@@ -274,6 +273,75 @@ function pollTick() {
   activateChunkGroup(idx);
 }
 
+/* ── Direct OpenAI call (API key never leaves the browser) ───────── */
+const OPENAI_SYSTEM_PROMPT = (
+  "You are an expert real-time fact checker analysing video transcripts. " +
+  "Your job is to identify every specific, checkable claim in the transcript " +
+  "segment supplied. For each claim:\n" +
+  "  - Classify it as FACT or SPECULATION.\n" +
+  "  - FACT: a verifiable statement backed by evidence. Provide 1-3 real, " +
+  "publicly accessible source URLs (Wikipedia, academic papers, reputable news, " +
+  "official government/organisation sites). Only include URLs you are highly " +
+  "confident exist.\n" +
+  "  - SPECULATION: an opinion, prediction, unverified assertion, or exaggeration. " +
+  "Briefly explain why.\n\n" +
+  "Return ONLY a JSON object in this exact shape:\n" +
+  "{\n" +
+  '  "claims": [\n' +
+  "    {\n" +
+  '      "claim": "<short paraphrase of the claim>",\n' +
+  '      "type": "FACT" | "SPECULATION",\n' +
+  '      "explanation": "<brief explanation>",\n' +
+  '      "sources": ["<url>", ...]\n' +
+  "    }\n" +
+  "  ]\n" +
+  "}\n" +
+  'If there are no specific claims, return {"claims": []}.'
+);
+
+async function factCheckWithOpenAI(text, apiKey, videoTitleStr) {
+  if (!text.trim()) return { claims: [] };
+
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method:  "POST",
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model:           "gpt-4o-mini",
+      messages: [
+        { role: "system", content: OPENAI_SYSTEM_PROMPT },
+        { role: "user",   content: `Video title: "${videoTitleStr}"\n\nTranscript segment:\n${text}` }
+      ],
+      response_format: { type: "json_object" },
+      temperature:     0.2,
+      max_tokens:      1200
+    })
+  });
+
+  if (res.status === 401) {
+    const err = new Error("Invalid OpenAI API key");
+    err.status = 401;
+    throw err;
+  }
+  if (res.status === 429) {
+    const err = new Error("Rate limit – too many requests to OpenAI");
+    err.status = 429;
+    throw err;
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    const err  = new Error(body.error?.message || `OpenAI error ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+
+  const json   = await res.json();
+  const result = JSON.parse(json.choices[0].message.content);
+  return { claims: result.claims || [] };
+}
+
 /* ── Chunk fetching ──────────────────────────────────────────────── */
 async function fetchChunk(idx) {
   if (idx < 0 || idx >= chunks.length) return;
@@ -297,11 +365,7 @@ async function fetchChunk(idx) {
   const apiKey = apiKeyInput.value.trim();
 
   try {
-    const data = await fetchJSON("/api/factcheck", {
-      text:        chunks[idx].text,
-      api_key:     apiKey,
-      video_title: videoTitle
-    });
+    const data = await factCheckWithOpenAI(chunks[idx].text, apiKey, videoTitle);
     chunkResults[idx] = { status: "done", claims: data.claims || [] };
 
     // Persist result for future sessions (instant on re-watch)

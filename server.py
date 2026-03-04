@@ -1,29 +1,54 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript
 from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig
 import re
-import json
-import time
 import requests
-import openai
 import os
 
 app = Flask(__name__)
-CORS(app, origins="*")
+
+# Only allow requests from the deployed frontend and from the Chrome extension.
+# All other origins (random websites trying to abuse the endpoint) are rejected.
+def _is_allowed_origin(origin: str) -> bool:
+    if not origin:
+        return True  # non-browser callers (curl, Render health checks, etc.)
+    return (
+        origin == "https://fact-checker-chrome-ext.onrender.com"
+        or origin.startswith("chrome-extension://")
+    )
+
+CORS(app, origins=_is_allowed_origin)
+
+# Rate-limit /api/load to prevent transcript-scraping abuse.
+# Reads the real IP from X-Forwarded-For when behind Render's proxy.
+def _get_real_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return forwarded.split(",")[0].strip() if forwarded else get_remote_address()
+
+limiter = Limiter(key_func=_get_real_ip, app=app, default_limits=[])
+
+# Static files served from this directory — explicit allowlist only.
+# Never use send_from_directory(".", filename) with an open wildcard route;
+# that would expose server.py, .env, and any other file in the working dir.
+_ALLOWED_STATIC = frozenset(["index.html", "app.js", "style.css", "player.html", "player.js"])
 
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"}), 200
 
-# Serve frontend static files
+# Serve frontend static files — only whitelisted filenames accepted.
 @app.route("/")
 def index():
     return send_from_directory(".", "index.html")
 
 @app.route("/<path:filename>")
 def static_files(filename):
+    if filename not in _ALLOWED_STATIC:
+        return jsonify({"error": "Not found"}), 404
     return send_from_directory(".", filename)
 
 # Build proxy config from environment variables if available
@@ -99,6 +124,7 @@ def chunk_transcript(transcript, chunk_duration=40):
 
 
 @app.route("/api/load", methods=["POST"])
+@limiter.limit("20 per minute")
 def load_video():
     """Load video: fetch title + transcript and return chunked segments."""
     data = request.json or {}
@@ -139,85 +165,6 @@ def load_video():
         "title": title,
         "chunks": chunks
     })
-
-
-@app.route("/api/factcheck", methods=["POST"])
-def fact_check():
-    """Run GPT fact-check on a transcript chunk."""
-    data = request.json or {}
-    text = data.get("text", "")
-    api_key = data.get("api_key", "")
-    video_title = data.get("video_title", "Unknown Video")
-
-    if not api_key:
-        return jsonify({"error": "OpenAI API key is required"}), 400
-    if not text.strip():
-        return jsonify({"claims": []}), 200
-
-    client = openai.OpenAI(api_key=api_key)
-
-    system_prompt = (
-        "You are an expert real-time fact checker analysing video transcripts. "
-        "Your job is to identify every specific, checkable claim in the transcript "
-        "segment supplied. For each claim:\n"
-        "  - Classify it as FACT or SPECULATION.\n"
-        "  - FACT: a verifiable statement backed by evidence. Provide 1-3 real, "
-        "publicly accessible source URLs (Wikipedia, academic papers, reputable news, "
-        "official government/organisation sites). Only include URLs you are highly "
-        "confident exist.\n"
-        "  - SPECULATION: an opinion, prediction, unverified assertion, or exaggeration. "
-        "Briefly explain why.\n\n"
-        "Return ONLY a JSON object in this exact shape:\n"
-        "{\n"
-        '  "claims": [\n'
-        "    {\n"
-        '      "claim": "<short paraphrase of the claim>",\n'
-        '      "type": "FACT" | "SPECULATION",\n'
-        '      "explanation": "<brief explanation>",\n'
-        '      "sources": ["<url>", ...]\n'
-        "    }\n"
-        "  ]\n"
-        "}\n"
-        "If there are no specific claims, return {\"claims\": []}."
-    )
-
-    user_prompt = f'Video title: "{video_title}"\n\nTranscript segment:\n{text}'
-
-    max_attempts = 4
-    backoff = 8  # seconds before first retry
-    last_error = None
-
-    for attempt in range(max_attempts):
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-                max_tokens=1200
-            )
-            result = json.loads(response.choices[0].message.content)
-            claims = result.get("claims", [])
-            break  # success
-        except openai.AuthenticationError:
-            return jsonify({"error": "Invalid OpenAI API key"}), 401
-        except openai.RateLimitError as e:
-            last_error = e
-            if attempt < max_attempts - 1:
-                wait = backoff * (2 ** attempt)  # 8s, 16s, 32s
-                print(f"Rate limited – retrying in {wait}s (attempt {attempt + 1}/{max_attempts})")
-                time.sleep(wait)
-            else:
-                return jsonify({"error": f"Rate limit persists after {max_attempts} attempts – try again in a minute"}), 429
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-    else:
-        return jsonify({"error": str(last_error)}), 429
-
-    return jsonify({"claims": claims})
 
 
 if __name__ == "__main__":
