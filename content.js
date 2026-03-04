@@ -12,7 +12,13 @@ function safeSend(msg) {
 }
 
 // Poll the <video> element and forward time updates to the side panel
-setInterval(() => {
+const _interval = setInterval(() => {
+  // Stop polling if the extension was reloaded/invalidated
+  if (!chrome.runtime?.id) {
+    clearInterval(_interval);
+    _observer.disconnect();
+    return;
+  }
   const video = document.querySelector("video");
   if (!video) return;
   const t = video.currentTime;
@@ -25,12 +31,18 @@ setInterval(() => {
 
 // Watch for YouTube's SPA navigation (new video loaded without full page reload)
 let lastUrl = location.href;
-new MutationObserver(() => {
+const _observer = new MutationObserver(() => {
+  if (!chrome.runtime?.id) {
+    _observer.disconnect();
+    clearInterval(_interval);
+    return;
+  }
   if (location.href !== lastUrl) {
     lastUrl = location.href;
     safeSend({ type: "urlChange", url: location.href });
   }
-}).observe(document, { subtree: true, childList: true });
+});
+_observer.observe(document, { subtree: true, childList: true });
 
 // Handle seek commands sent from the side panel
 chrome.runtime.onMessage.addListener((msg) => {
