@@ -137,7 +137,6 @@ def load_video():
     return jsonify({
         "video_id": video_id,
         "title": title,
-        "transcript": raw_entries,
         "chunks": chunks
     })
 

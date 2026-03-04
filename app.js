@@ -2,34 +2,18 @@
    FactCheckAI  –  app.js
    ══════════════════════════════════════════════════════════════════ */
 
-const API_BASE   = "https://fact-checker-chrome-ext.onrender.com";
-const ARCHIVE_KEY = "factcheck_archive";   // localStorage key
+const API_BASE         = "https://fact-checker-chrome-ext.onrender.com";
+const ARCHIVE_KEY       = "factcheck_archive";  // localStorage key
+const TRANSCRIPT_TTL_MS = 24 * 60 * 60 * 1000; // 24-hour transcript cache TTL
 
-/* ── Server wake-up ping ─────────────────────────────────────────── */
-// Render free tier sleeps after inactivity; ping /health on load so the
-// server is warm by the time the user clicks the button.
-(function pingServer() {
-  const badge = document.getElementById("server-status");
-  if (badge) { badge.textContent = "⏳ Server waking up…"; badge.className = "server-badge waking"; }
-  const t0 = Date.now();
-  const ctrl = new AbortController();
-  const tid = setTimeout(() => ctrl.abort(), 90000);
-  fetch(API_BASE + "/health", { signal: ctrl.signal })
-    .then(r => r.ok ? r.json() : Promise.reject(r.status))
-    .then(() => {
-      if (badge) { badge.textContent = "✓ Server ready"; badge.className = "server-badge ready"; }
-      setTimeout(() => { if (badge) badge.classList.add("fade-out"); }, 3000);
-    })
-    .catch(() => {
-      if (badge) { badge.textContent = "✗ Server unreachable"; badge.className = "server-badge error"; }
-    })
-    .finally(() => clearTimeout(tid));
-})();
+// /health wake-up ping is sent by background.js the moment the extension
+// loads — before the side panel is ever opened — so no ping needed here.
 
 /* ── State ───────────────────────────────────────────────────────── */
 let currentPlayerTime = 0;    // relayed by content.js
 let videoPaused       = true;
 let videoTitle        = "";
+let currentVideoId    = null; // YouTube video ID of the currently loaded video
 let chunks            = [];   // [{start, end, text}]
 
 let chunkResults   = {};       // chunkIdx -> {status:'pending'|'done'|'error', claims:[]}
@@ -53,6 +37,37 @@ const fcLoading      = document.getElementById("fc-loading");
 const archiveGroups  = document.getElementById("archive-groups");
 const archiveEmpty   = document.getElementById("archive-empty");
 const clearArchiveBtn = document.getElementById("clear-archive-btn");
+
+/* ── Client-side caching (chrome.storage.local) ──────────────────── */
+// Extracts the 11-char YouTube video ID from any standard URL format.
+function extractVideoIdClient(url) {
+  const m = url.match(/(?:v=|youtu\.be\/|embed\/|shorts\/)([0-9A-Za-z_-]{11})/);
+  return m ? m[1] : null;
+}
+
+// Transcript cache: stores { title, chunks, cachedAt } keyed by video ID.
+async function getCachedTranscript(videoId) {
+  const key    = `factcheck_transcript_${videoId}`;
+  const result = await chrome.storage.local.get(key);
+  const entry  = result[key];
+  if (entry && (Date.now() - entry.cachedAt) < TRANSCRIPT_TTL_MS) return entry;
+  return null;
+}
+async function setCachedTranscript(videoId, data) {
+  await chrome.storage.local.set({
+    [`factcheck_transcript_${videoId}`]: { ...data, cachedAt: Date.now() }
+  });
+}
+
+// Chunk-result cache: stores { claims } keyed by videoId + chunk index.
+async function getCachedChunkResult(videoId, idx) {
+  const key    = `factcheck_chunk_${videoId}_${idx}`;
+  const result = await chrome.storage.local.get(key);
+  return result[key] || null;
+}
+async function setCachedChunkResult(videoId, idx, data) {
+  await chrome.storage.local.set({ [`factcheck_chunk_${videoId}_${idx}`]: data });
+}
 
 /* ── Persist API key across sessions ─────────────────────────────── */
 (function restoreKey() {
@@ -128,7 +143,32 @@ async function handleLoad() {
   hideSetupError();
   setLoadBtnLoading(true, "Contacting server…");
 
-  // Render free tier can take 30–60 s to wake from sleep
+  // ── Fast path: serve transcript from local cache ──────────────────
+  const vidId = extractVideoIdClient(url);
+  if (vidId) {
+    const cached = await getCachedTranscript(vidId);
+    if (cached) {
+      applyLoadedData({ video_id: vidId, title: cached.title, chunks: cached.chunks }, apiKey);
+      setLoadBtnLoading(false, "");
+      const badge = document.getElementById("server-status");
+      if (badge) {
+        badge.textContent = "✓ Loaded from cache";
+        badge.className = "server-badge ready";
+        badge.classList.remove("hidden");
+        setTimeout(() => badge.classList.add("fade-out"), 3000);
+      }
+      return;
+    }
+  }
+
+  // ── Slow path: fetch transcript from server ───────────────────────
+  const badge = document.getElementById("server-status");
+  if (badge) {
+    badge.textContent = "⏳ Server waking up…";
+    badge.className = "server-badge waking";
+    badge.classList.remove("hidden");
+  }
+
   const wakeTimer = setTimeout(() => {
     setLoadBtnLoading(true, "Server is waking up (free tier)…");
   }, 8000);
@@ -136,44 +176,62 @@ async function handleLoad() {
   try {
     const data = await fetchJSON("/api/load", { url });
     clearTimeout(wakeTimer);
-    videoTitle = data.title;
-    chunks     = data.chunks;
-    chunkResults = {};
-    inFlight.clear();
-    currentChunkIdx = -1;
-    currentPlayerTime = 0;
-    videoPaused = false;
 
-    localStorage.setItem("factcheck_api_key", apiKey);
+    // Cache the transcript for future sessions
+    if (data.video_id) {
+      setCachedTranscript(data.video_id, { title: data.title, chunks: data.chunks });
+    }
 
-    // Show workspace
-    workspace.classList.remove("hidden");
-    titleDisplay.textContent = videoTitle;
+    applyLoadedData(data, apiKey);
 
-    renderArchive();
-
-    // Reset fact-check display for new video
-    resultsBody.innerHTML = "";
-    resultsBody.appendChild(makePlaceholder("Play the video to start fact checking…"));
-    currentChunkIdx = -1;
-    chunkStatus.textContent = "";
-    timeDisplay.textContent = "0:00";
-
-    // Start fallback polling in case content script messages are delayed
-    startFallbackPolling();
-
-    // Immediately run a poll tick so chunk 0 group is created and fetching starts
-    pollTick();
-
-    // Scroll workspace into view
-    workspace.scrollIntoView({ behavior: "smooth" });
-
+    if (badge) {
+      badge.textContent = "✓ Server ready";
+      badge.className = "server-badge ready";
+      setTimeout(() => badge.classList.add("fade-out"), 3000);
+    }
   } catch (err) {
     clearTimeout(wakeTimer);
+    if (badge) { badge.textContent = "✗ Server unreachable"; badge.className = "server-badge error"; }
     showSetupError(err.message || "Failed to load video. Check the URL and try again.");
   } finally {
     setLoadBtnLoading(false, "");
   }
+}
+
+// Shared setup routine used by both the cached and live load paths.
+function applyLoadedData(data, apiKey) {
+  currentVideoId    = data.video_id || null;
+  videoTitle        = data.title;
+  chunks            = data.chunks;
+  chunkResults      = {};
+  inFlight.clear();
+  currentChunkIdx   = -1;
+  currentPlayerTime = 0;
+  videoPaused       = false;
+
+  localStorage.setItem("factcheck_api_key", apiKey);
+
+  // Show workspace
+  workspace.classList.remove("hidden");
+  titleDisplay.textContent = videoTitle;
+
+  renderArchive();
+
+  // Reset fact-check display for new video
+  resultsBody.innerHTML = "";
+  resultsBody.appendChild(makePlaceholder("Play the video to start fact checking…"));
+  currentChunkIdx = -1;
+  chunkStatus.textContent = "";
+  timeDisplay.textContent = "0:00";
+
+  // Start fallback polling in case content script messages are delayed
+  startFallbackPolling();
+
+  // Immediately run a poll tick so chunk 0 group is created and fetching starts
+  pollTick();
+
+  // Scroll workspace into view
+  workspace.scrollIntoView({ behavior: "smooth" });
 }
 
 /* ── Polling (driven by content.js timeUpdate messages + fallback interval) ── */
@@ -202,10 +260,10 @@ function pollTick() {
   const idx = chunkIndexAt(t);
   if (idx === -1) return;
 
-  // Fetch current + pre-fetch ahead
+  // Fetch current chunk; pre-fetch ahead only while playing (saves API quota when paused)
   fetchChunk(idx);
-  if (idx + 1 < chunks.length) fetchChunk(idx + 1);
-  if (idx + 2 < chunks.length) fetchChunk(idx + 2);
+  if (!videoPaused && idx + 1 < chunks.length) fetchChunk(idx + 1);
+  if (!videoPaused && idx + 2 < chunks.length) fetchChunk(idx + 2);
 
   if (idx === currentChunkIdx) return;  // same chunk – nothing new
 
@@ -223,6 +281,17 @@ async function fetchChunk(idx) {
   if (inFlight.has(idx)) return;
   if (chunkResults[idx] && chunkResults[idx].status === "done") return;
 
+  // Fast path: result already cached locally — no API call needed
+  if (currentVideoId) {
+    const cached = await getCachedChunkResult(currentVideoId, idx);
+    if (cached) {
+      chunkResults[idx] = { status: "done", claims: cached.claims };
+      saveSourcesToArchive(cached.claims, chunks[idx].start);
+      renderChunkGroup(idx);
+      return;
+    }
+  }
+
   inFlight.add(idx);
 
   const apiKey = apiKeyInput.value.trim();
@@ -234,6 +303,11 @@ async function fetchChunk(idx) {
       video_title: videoTitle
     });
     chunkResults[idx] = { status: "done", claims: data.claims || [] };
+
+    // Persist result for future sessions (instant on re-watch)
+    if (currentVideoId) {
+      setCachedChunkResult(currentVideoId, idx, { claims: data.claims || [] });
+    }
 
     // Save sources to archive
     saveSourcesToArchive(data.claims || [], chunks[idx].start);
