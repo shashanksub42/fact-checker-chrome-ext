@@ -345,27 +345,28 @@ async function factCheckWithOpenAI(text, apiKey, videoTitleStr) {
 /* ── Chunk fetching ──────────────────────────────────────────────── */
 async function fetchChunk(idx) {
   if (idx < 0 || idx >= chunks.length) return;
-  // Allow retrying errored chunks; block only on in-flight or successful results
+  // Block duplicates and already-completed chunks
   if (inFlight.has(idx)) return;
   if (chunkResults[idx] && chunkResults[idx].status === "done") return;
 
-  // Fast path: result already cached locally — no API call needed
-  if (currentVideoId) {
-    const cached = await getCachedChunkResult(currentVideoId, idx);
-    if (cached) {
-      chunkResults[idx] = { status: "done", claims: cached.claims };
-      saveSourcesToArchive(cached.claims, chunks[idx].start);
-      renderChunkGroup(idx);
-      return;
-    }
-  }
-
+  // Mark in-flight BEFORE any await so concurrent pollTick calls can't
+  // pass the guard above and fire a second request for the same chunk.
   inFlight.add(idx);
 
-  const apiKey = apiKeyInput.value.trim();
-
   try {
-    const data = await factCheckWithOpenAI(chunks[idx].text, apiKey, videoTitle);
+    // Fast path: result already cached locally — no API call needed
+    if (currentVideoId) {
+      const cached = await getCachedChunkResult(currentVideoId, idx);
+      if (cached) {
+        chunkResults[idx] = { status: "done", claims: cached.claims };
+        saveSourcesToArchive(cached.claims, chunks[idx].start);
+        renderChunkGroup(idx);
+        return;
+      }
+    }
+
+    const apiKey = apiKeyInput.value.trim();
+    const data   = await factCheckWithOpenAI(chunks[idx].text, apiKey, videoTitle);
     chunkResults[idx] = { status: "done", claims: data.claims || [] };
 
     // Persist result for future sessions (instant on re-watch)
