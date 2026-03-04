@@ -1,5 +1,4 @@
 from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -21,7 +20,19 @@ def _is_allowed_origin(origin: str) -> bool:
         or origin.startswith("chrome-extension://")
     )
 
-CORS(app, origins=_is_allowed_origin)
+@app.after_request
+def _apply_cors(response):
+    origin = request.headers.get("Origin", "")
+    if _is_allowed_origin(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin or "*"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+@app.route("/", methods=["OPTIONS"])
+@app.route("/<path:filename>", methods=["OPTIONS"])
+def _options_preflight(**kwargs):
+    return "", 204
 
 # Rate-limit /api/load to prevent transcript-scraping abuse.
 # Reads the real IP from X-Forwarded-For when behind Render's proxy.
